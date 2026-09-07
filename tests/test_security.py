@@ -514,3 +514,34 @@ def test_whatsapp_bot_token_does_not_fallback_to_admin_token(monkeypatch):
         m.setattr(whatsapp, "WHATSAPP_ADMIN_NUMBERS", {"whatsapp:+15551234567"})
         assert whatsapp._bot_token_for_sender("whatsapp:+15551234567") == "admin-sk-token"
         assert whatsapp._bot_token_for_sender("whatsapp:+15550001111") is None
+
+
+def test_mercadopago_webhook_rejects_underpaid_subscription(monkeypatch):
+    from market_core import db_create_subscription_request, db_get_subscription, ensure_db_initialized
+
+    monkeypatch.setattr("server_deps.check_rate_limit", lambda _ip: None)
+    ensure_db_initialized()
+    req = db_create_subscription_request("admin", "underpay@test.com", "mercadopago:test")
+    request_id = req["id"]
+
+    async def fake_get_payment(payment_id):
+        return {
+            "status": "approved",
+            "external_reference": f"CLI-Market-{request_id}",
+            "transaction_amount": 1.0,
+        }
+
+    monkeypatch.setattr("market_connectors.mercadopago_payments.get_payment", fake_get_payment)
+    monkeypatch.setattr("market_connectors.mercadopago_payments.webhook_secret", lambda: "")
+    monkeypatch.setattr(
+        "market_connectors.mercadopago_payments.parse_webhook_payment_id",
+        lambda **kw: ("pay-underpay", "payment"),
+    )
+
+    assert db_get_subscription("admin")["tier"] == "free"
+    r = client.post("/checkout/mercadopago-webhook?data.id=pay-underpay")
+    assert r.status_code == 200
+    actions = r.json().get("actions", [])
+    assert any(a.startswith(f"payment_underpaid:{request_id}:") for a in actions)
+    assert not any("pro_activated:" in a for a in actions)
+    assert db_get_subscription("admin")["tier"] == "free"

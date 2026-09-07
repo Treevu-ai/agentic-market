@@ -9,6 +9,7 @@ from market_core import (
     db_delete_billing_pending,
     db_find_order_by_gateway_ref,
     db_find_order_by_id,
+    db_find_subscription_request,
     db_get_billing_pending,
     db_get_user_email,
     db_set_order_gateway_ref,
@@ -25,6 +26,8 @@ from routers.billing.activation import (
     _is_retailer_growth_subscription_request_id,
     _parse_subscription_request_ref,
     activate_paypal_subscription,
+    expected_subscription_payment_pen_options,
+    mp_transaction_covers_amount,
 )
 from routers.billing.notifications import (
     _notify_procure_payment,
@@ -296,19 +299,34 @@ async def mercadopago_webhook(request: Request):
     ext_ref = str(pay.get("external_reference") or "")
     order_id = parse_external_order_id(ext_ref)
     actions: list[str] = []
+    paid_pen = float(pay.get("transaction_amount") or 0)
 
     pro_request_id = _parse_subscription_request_ref(ext_ref)
     if status == "approved" and pro_request_id:
-        if _is_procure_subscription_request_id(pro_request_id):
-            actions.extend(
-                _activate_procure_from_request(pro_request_id, source="mercadopago_webhook")
-            )
-        elif _is_retailer_growth_subscription_request_id(pro_request_id):
-            actions.extend(
-                _activate_retailer_growth_from_request(pro_request_id, source="mercadopago_webhook")
-            )
+        sub_req = db_find_subscription_request(request_id=pro_request_id)
+        if not sub_req:
+            actions.append(f"request_not_found:{pro_request_id}")
         else:
-            actions.extend(_activate_pro_from_request(pro_request_id, source="mercadopago_webhook"))
+            expected_pen = expected_subscription_payment_pen_options(pro_request_id, sub_req)
+            if not mp_transaction_covers_amount(paid_pen, expected_pen):
+                actions.append(f"payment_underpaid:{pro_request_id}:{paid_pen}")
+                logger.warning(
+                    "mercadopago_webhook underpaid subscription_request_id=%s paid=%s expected=%s payment_id=%s",
+                    pro_request_id,
+                    paid_pen,
+                    expected_pen,
+                    payment_id,
+                )
+            elif _is_procure_subscription_request_id(pro_request_id):
+                actions.extend(
+                    _activate_procure_from_request(pro_request_id, source="mercadopago_webhook")
+                )
+            elif _is_retailer_growth_subscription_request_id(pro_request_id):
+                actions.extend(
+                    _activate_retailer_growth_from_request(pro_request_id, source="mercadopago_webhook")
+                )
+            else:
+                actions.extend(_activate_pro_from_request(pro_request_id, source="mercadopago_webhook"))
         logger.info(
             "mercadopago_webhook subscription_request_id=%s payment_id=%s actions=%s",
             pro_request_id,
@@ -316,13 +334,27 @@ async def mercadopago_webhook(request: Request):
             actions,
         )
     elif status == "approved" and order_id:
-        if db_update_order_status(order_id, "paid"):
-            actions.append(f"paid:{order_id}")
-            notified = _notify_procure_payment(order_id, "paid")
-            if notified:
-                actions.append(notified)
-        else:
+        order_row = db_find_order_by_id(order_id)
+        if not order_row:
             actions.append(f"order_not_found:{order_id}")
+        else:
+            expected_total = float(order_row.get("total") or 0)
+            if not mp_transaction_covers_amount(paid_pen, [expected_total]):
+                actions.append(f"payment_underpaid:{order_id}:{paid_pen}")
+                logger.warning(
+                    "mercadopago_webhook underpaid order_id=%s paid=%s expected=%s payment_id=%s",
+                    order_id,
+                    paid_pen,
+                    expected_total,
+                    payment_id,
+                )
+            elif db_update_order_status(order_id, "paid"):
+                actions.append(f"paid:{order_id}")
+                notified = _notify_procure_payment(order_id, "paid")
+                if notified:
+                    actions.append(notified)
+            else:
+                actions.append(f"order_not_found:{order_id}")
     elif pro_request_id:
         actions.append(f"pro_status:{status}:{pro_request_id}")
     elif order_id:

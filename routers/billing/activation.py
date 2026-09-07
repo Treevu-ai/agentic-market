@@ -84,6 +84,84 @@ def _retailer_growth_price_pen() -> float:
     return round(float(RETAILER_GROWTH_PRICE_USD) * pen_per_usd, 2)
 
 
+_WALLET_PEN_RE = re.compile(r"S/?\s*([\d.]+)", re.I)
+
+
+def _parse_pen_from_wallet_payment_link(payment_link: str) -> float | None:
+    """Parse S/ amount from yape:S/146.25 or plin:S/146.25 style payment notes."""
+    link = (payment_link or "").strip()
+    if not link.lower().startswith(("yape:", "plin:")):
+        return None
+    match = _WALLET_PEN_RE.search(link)
+    if not match:
+        return None
+    try:
+        return round(float(match.group(1)), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def expected_subscription_payment_pen_options(request_id: str, req: dict) -> list[float]:
+    """Valid PEN payment amounts for a pending subscription request."""
+    rid = (request_id or "").strip().upper()
+    if not rid:
+        return []
+    prefix = rid.split("-", 1)[0]
+    payment_link = (req.get("payment_link") or "").strip()
+
+    wallet_pen = _parse_pen_from_wallet_payment_link(payment_link)
+    if wallet_pen is not None:
+        return [wallet_pen]
+
+    if prefix == "RGW":
+        return [_retailer_growth_price_pen()]
+    if prefix == "STR":
+        return [_price_pen_for_plan("starter")]
+    if prefix == "PRO":
+        return [_price_pen_for_plan("pro"), _price_pen_for_plan("pro_annual")]
+    from procure_billing import PROCURE_PLANS, procure_price_pen
+
+    for slug, meta in PROCURE_PLANS.items():
+        if meta["request_prefix"] == prefix:
+            return [procure_price_pen(slug)]
+    return []
+
+
+def mp_transaction_covers_amount(
+    paid: float,
+    expected_options: list[float],
+    *,
+    tolerance: float = 0.05,
+) -> bool:
+    """True when paid PEN meets at least one expected subscription/order total."""
+    try:
+        paid_f = float(paid)
+    except (TypeError, ValueError):
+        return False
+    if paid_f <= 0 or not expected_options:
+        return False
+    return any(paid_f + tolerance >= round(float(exp), 2) for exp in expected_options)
+
+
+def resolve_subscription_card_payment_amount(
+    request_id: str,
+    req: dict,
+    client_amount: float | None,
+) -> float:
+    """Server-side PEN amount for card-payment tied to a subscription reference."""
+    options = expected_subscription_payment_pen_options(request_id, req)
+    if not options:
+        raise ValueError("cannot resolve subscription amount")
+    if len(options) == 1:
+        return options[0]
+    if client_amount is None:
+        raise ValueError("amount required to distinguish subscription plans")
+    matches = [opt for opt in options if abs(float(client_amount) - opt) <= 0.05]
+    if len(matches) != 1:
+        raise ValueError("amount does not match subscription price")
+    return matches[0]
+
+
 def _wallet_payment_phone() -> str:
     return (os.getenv("YAPE_PLIN_NUMBER") or os.getenv("PLIN_NUMBER") or "").strip()
 
