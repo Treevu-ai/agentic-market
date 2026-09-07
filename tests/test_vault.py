@@ -346,6 +346,75 @@ def test_card_payment_with_order_id_ignores_client_amount():
     assert captured["amount"] == 25.0
 
 
+def test_card_payment_subscription_ref_ignores_underpaid_client_amount():
+    from market_core import db_create_subscription_request
+    from procure_billing import procure_price_pen
+
+    req = db_create_subscription_request(
+        "vault_tester",
+        "vault_tester@example.com",
+        "mercadopago:test",
+        prefix="PCP",
+    )
+    request_id = req["id"]
+    captured = {}
+
+    async def _capture_charge(token_id, amount, **kwargs):
+        captured["amount"] = amount
+        captured["external_reference"] = kwargs.get("external_reference")
+        return {"payment_id": 99, "status": "approved", "card_last_four": "4242"}
+
+    with patch(
+        "market_connectors.mercadopago_payments.create_card_payment",
+        new=_capture_charge,
+        create=True,
+    ):
+        r = client.post(
+            "/checkout/card-payment",
+            headers=_auth(),
+            json={
+                "card_token_id": "ct_tok",
+                "amount": 0.01,
+                "reference": f"CLI-Market-{request_id}",
+            },
+        )
+    assert r.status_code == 200
+    assert captured["amount"] == procure_price_pen("pro")
+    assert captured["external_reference"] == f"CLI-Market-{request_id}"
+
+
+def test_card_payment_pro_subscription_ref_rejects_underpaid_amount():
+    from market_core import db_create_subscription_request
+
+    req = db_create_subscription_request("vault_tester", "vault_tester@example.com", "mercadopago:test")
+    r = client.post(
+        "/checkout/card-payment",
+        headers=_auth(),
+        json={
+            "card_token_id": "ct_tok",
+            "amount": 0.01,
+            "reference": f"CLI-Market-{req['id']}",
+        },
+    )
+    assert r.status_code == 400
+
+
+def test_card_payment_rejects_foreign_subscription_reference():
+    from market_core import db_create_subscription_request
+
+    req = db_create_subscription_request("other_user", "other@example.com", "mercadopago:test")
+    r = client.post(
+        "/checkout/card-payment",
+        headers=_auth(),
+        json={
+            "card_token_id": "ct_tok",
+            "amount": 1,
+            "reference": f"CLI-Market-{req['id']}",
+        },
+    )
+    assert r.status_code == 403
+
+
 def test_save_card_success():
     # Caller already owns cust_1 from a prior save — reused as-is.
     bind_vault_customer("vault_tester", "cust_1")

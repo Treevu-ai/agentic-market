@@ -1157,6 +1157,7 @@ def test_pro_checkout_mp_dedupe_hides_checkout_url_from_unauthenticated_caller(m
 
 def test_mercadopago_webhook_activates_pro_request(monkeypatch):
     from market_core import db_create_subscription_request, db_get_subscription
+    from routers.billing.activation import _pro_price_pen
 
     monkeypatch.setattr("server_deps.check_rate_limit", lambda _ip: None)
     req = db_create_subscription_request("admin", "mp-webhook@test.com", "mercadopago:test")
@@ -1166,6 +1167,7 @@ def test_mercadopago_webhook_activates_pro_request(monkeypatch):
         return {
             "status": "approved",
             "external_reference": f"CLI-Market-{request_id}",
+            "transaction_amount": _pro_price_pen(),
         }
 
     monkeypatch.setattr("market_connectors.mercadopago_payments.get_payment", fake_get_payment)
@@ -1190,6 +1192,7 @@ def test_mercadopago_webhook_activates_pro_request(monkeypatch):
 
 def test_mercadopago_webhook_activation_email_skipped_when_smtp_fails(monkeypatch):
     from market_core import db_create_subscription_request, db_get_subscription
+    from routers.billing.activation import _pro_price_pen
 
     monkeypatch.setattr("server_deps.check_rate_limit", lambda _ip: None)
     req = db_create_subscription_request("admin", "mp-skip@test.com", "mercadopago:test")
@@ -1199,6 +1202,7 @@ def test_mercadopago_webhook_activation_email_skipped_when_smtp_fails(monkeypatc
         return {
             "status": "approved",
             "external_reference": f"CLI-Market-{request_id}",
+            "transaction_amount": _pro_price_pen(),
         }
 
     monkeypatch.setattr("market_connectors.mercadopago_payments.get_payment", fake_get_payment)
@@ -1279,6 +1283,7 @@ def test_procure_subscribe_mercadopago_returns_checkout_url(monkeypatch):
 
 def test_mercadopago_webhook_activates_procure_request(monkeypatch):
     from market_core import db_create_subscription_request, db_get_subscription
+    from procure_billing import procure_price_pen
 
     monkeypatch.setattr("server_deps.check_rate_limit", lambda _ip: None)
     req = db_create_subscription_request(
@@ -1294,6 +1299,7 @@ def test_mercadopago_webhook_activates_procure_request(monkeypatch):
         return {
             "status": "approved",
             "external_reference": f"CLI-Market-{request_id}",
+            "transaction_amount": procure_price_pen("pro"),
         }
 
     monkeypatch.setattr("market_connectors.mercadopago_payments.get_payment", fake_get_payment)

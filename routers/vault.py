@@ -20,7 +20,7 @@ import logging
 from fastapi import APIRouter, Body, Header, HTTPException
 
 from market_audit import record_audit
-from market_core import db_get_user_email, get_db
+from market_core import db_find_subscription_request, db_get_user_email, get_db
 from market_vault import (
     bind_vault_customer,
     bind_vault_payment_token,
@@ -33,6 +33,10 @@ from market_vault import (
 )
 from market_security import validate_cli_market_redirect_url
 from server_deps import require_api_key
+from routers.billing.activation import (
+    _parse_subscription_request_ref,
+    resolve_subscription_card_payment_amount,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -233,15 +237,44 @@ async def card_payment(
     username = require_api_key(authorization)
     card_token_id = (body.get("card_token_id") or body.get("token") or "").strip()
     order_id = (body.get("order_id") or "").strip()
+    reference = (body.get("reference") or "").strip()
     if not card_token_id:
         raise HTTPException(status_code=400, detail="card_token_id required")
     if order_id:
         amount = _resolve_pending_order_total(username, order_id)
+        external_reference = reference or order_id
     else:
-        amount = body.get("amount")
-        if not amount or float(amount) <= 0:
-            raise HTTPException(status_code=400, detail="amount must be > 0")
-        amount = float(amount)
+        subscription_request_id = _parse_subscription_request_ref(reference) if reference else None
+        if subscription_request_id:
+            sub_req = db_find_subscription_request(request_id=subscription_request_id)
+            if not sub_req:
+                raise HTTPException(status_code=404, detail="subscription reference not found")
+            if (sub_req.get("username") or "").strip() != username:
+                raise HTTPException(status_code=403, detail="subscription reference not owned by caller")
+            if (sub_req.get("status") or "").lower() != "pending":
+                raise HTTPException(status_code=409, detail="subscription reference is not pending")
+            client_amount = body.get("amount")
+            try:
+                amount = resolve_subscription_card_payment_amount(
+                    subscription_request_id,
+                    sub_req,
+                    float(client_amount) if client_amount is not None else None,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            external_reference = (
+                reference
+                if reference.upper().startswith("CLI-MARKET-")
+                else f"CLI-Market-{subscription_request_id}"
+            )
+        elif reference:
+            raise HTTPException(status_code=400, detail="reference must be a pending subscription or order_id")
+        else:
+            amount = body.get("amount")
+            if not amount or float(amount) <= 0:
+                raise HTTPException(status_code=400, detail="amount must be > 0")
+            amount = float(amount)
+            external_reference = f"card-{username}"
 
     from market_connectors.mercadopago_payments import create_card_payment
 
@@ -252,7 +285,7 @@ async def card_payment(
         description=body.get("description", "CLI Market"),
         payer_email=body.get("email", ""),
         installments=int(body.get("installments", 1)),
-        external_reference=body.get("reference", f"card-{username}"),
+        external_reference=external_reference,
     )
     if "error" in result:
         raise HTTPException(status_code=result.get("status", 502), detail=result["error"])
