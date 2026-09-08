@@ -78,8 +78,14 @@ PY
 
 echo "→ Pro billing (yape — checkout_url, payment_link, or approve_url)"
 export MARKET_API_URL="$API"
-export SMOKE_USER="smoke-ci"
-export SMOKE_EMAIL="smoke+$(date +%s)@cli-market.dev"
+# Both must be fresh together: a fixed SMOKE_USER with a new SMOKE_EMAIL each
+# run 403s once "smoke-ci" already exists in prod with a prior run's email
+# ("el email no coincide con la cuenta de este usuario") -- confirmed live
+# 2026-09-08 (cli-market-world#563). Suffix both with the same timestamp so
+# the (username, email) pair is always a fresh account, never a collision.
+SMOKE_STAMP="$(date +%s)"
+export SMOKE_USER="smoke-ci-${SMOKE_STAMP}"
+export SMOKE_EMAIL="smoke+${SMOKE_STAMP}@cli-market.dev"
 _retry python3 - <<'PY'
 import json
 import os
