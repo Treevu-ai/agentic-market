@@ -12,6 +12,8 @@ import json
 import os
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -129,6 +131,54 @@ _DASHBOARD_COMPUTE_LOCK = 84957232
 # of wedging the endpoint until the next deploy.
 _DASHBOARD_LOCK_TIMEOUT_S = 15
 
+# _dashboard_data() itself (the ~15-query + full-table-scan compute) had no
+# wall-clock bound -- only the wait to *acquire* the advisory lock above did.
+# Confirmed live 2026-09-08 (cli-market-world#563): one machine's own /health
+# check failed for ~30s during a slow compute, because the same worker was
+# still blocked running it. Bounding the compute itself the same way the
+# lock-wait already is, so a slow/pathological run degrades to stale cache
+# instead of hanging the request (and, transitively, health checks sharing
+# the worker). The compute keeps running in its background thread past the
+# timeout -- not cancelled -- so it still populates the shared cache for the
+# *next* request even though this one fell back.
+_DASHBOARD_COMPUTE_TIMEOUT_S = 20
+_dashboard_compute_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dashboard-compute")
+
+
+def _save_dashboard_compute_when_done(future: Future[dict]) -> None:
+    try:
+        data = future.result()
+    except Exception:
+        return
+    _save_shared_dashboard_cache(data)
+
+
+def _run_dashboard_compute_bounded() -> dict:
+    """Run _dashboard_data() with a hard wall-clock bound (see
+    _DASHBOARD_COMPUTE_TIMEOUT_S). Only a timeout falls back to stale cache
+    (same semantics as the "couldn't get the advisory lock" branch below,
+    503 if there's genuinely nothing cached) -- a real exception from
+    _dashboard_data() itself is a bug and must propagate, same principle
+    test_dashboard_lock_fallback.py::test_lock_acquired_propagates_real_errors
+    already enforces for the lock path: don't mask real failures as a fake
+    503/stale response just because they happened after the lock/inside the
+    bounded compute.
+    """
+    future = _dashboard_compute_executor.submit(_dashboard_data)
+    try:
+        data = future.result(timeout=_DASHBOARD_COMPUTE_TIMEOUT_S)
+    except FutureTimeoutError:
+        future.add_done_callback(_save_dashboard_compute_when_done)
+        stale = _load_shared_dashboard_cache(ignore_ttl=True)
+        if stale is not None:
+            return stale
+        raise HTTPException(
+            status_code=503,
+            detail="Dashboard temporarily unavailable (compute is taking longer than usual, no cached data yet)",
+        )
+    _save_shared_dashboard_cache(data)
+    return data
+
 
 def _compute_dashboard_data_locked() -> dict:
     """Compute + persist _dashboard_data(), serialized across Fly machines.
@@ -142,9 +192,7 @@ def _compute_dashboard_data_locked() -> dict:
     """
     import market_core
     if not market_core.USE_PG:
-        data = _dashboard_data()
-        _save_shared_dashboard_cache(data)
-        return data
+        return _run_dashboard_compute_bounded()
 
     lock_db = get_db()
     lock_acquired = False
@@ -157,9 +205,7 @@ def _compute_dashboard_data_locked() -> dict:
         shared = _load_shared_dashboard_cache()
         if shared is not None:
             return shared
-        data = _dashboard_data()
-        _save_shared_dashboard_cache(data)
-        return data
+        return _run_dashboard_compute_bounded()
     except Exception:
         if lock_acquired:
             raise

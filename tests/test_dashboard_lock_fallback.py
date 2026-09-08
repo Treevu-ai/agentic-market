@@ -1,14 +1,22 @@
-"""Tests for _compute_dashboard_data_locked's lock-timeout fallback.
+"""Tests for _compute_dashboard_data_locked's lock-timeout fallback, and for
+_run_dashboard_compute_bounded's compute-timeout fallback.
 
 Regression coverage for the 2026-08-10 incident: a request that died
 mid-compute left its session holding the Postgres advisory lock, hanging
 every subsequent request to /dashboard/data indefinitely. The fix adds a
 lock_timeout and a stale-cache fallback — these tests exercise that path
 directly (PG-only code, so it's skipped locally unless USE_PG is patched).
+
+Also covers the 2026-09-08 follow-up (cli-market-world#563): the lock_timeout
+only bounded the *wait to acquire* the lock — _dashboard_data() itself, once
+the lock was held, could still run unbounded and block the worker (observed
+live: one machine's own /health failed ~30s during a slow compute). Same
+stale-cache-fallback pattern, now covering the compute itself too.
 """
 
 from __future__ import annotations
 
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -69,3 +77,57 @@ def test_lock_acquired_propagates_real_errors():
          patch.object(dashboard, "_dashboard_data", side_effect=RuntimeError("boom")):
         with pytest.raises(RuntimeError, match="boom"):
             dashboard._compute_dashboard_data_locked()
+
+
+def test_compute_timeout_falls_back_to_stale_cache(monkeypatch):
+    monkeypatch.setattr(dashboard, "_DASHBOARD_COMPUTE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(dashboard, "_dashboard_data", lambda: time.sleep(0.15))
+    with patch.object(dashboard, "_load_shared_dashboard_cache", return_value={"stale": True}) as m_load, \
+         patch.object(dashboard, "_save_shared_dashboard_cache") as m_save:
+        result = dashboard._run_dashboard_compute_bounded()
+
+        assert result == {"stale": True}
+        assert any(call.kwargs.get("ignore_ttl") for call in m_load.call_args_list)
+        # The slow compute keeps running in the background -- it must not be
+        # saved to cache synchronously as if it had completed in time.
+        m_save.assert_not_called()
+        time.sleep(0.2)  # let the background thread + its callback finish
+        # inside this test's own patch scope, so it can't leak into another
+        # test's mocks once this `with` block exits.
+
+
+def test_compute_timeout_with_no_cache_raises_503(monkeypatch):
+    monkeypatch.setattr(dashboard, "_DASHBOARD_COMPUTE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(dashboard, "_dashboard_data", lambda: time.sleep(0.15))
+    with patch.object(dashboard, "_load_shared_dashboard_cache", return_value=None), \
+         patch.object(dashboard, "_save_shared_dashboard_cache"):
+        with pytest.raises(HTTPException) as exc_info:
+            dashboard._run_dashboard_compute_bounded()
+        assert exc_info.value.status_code == 503
+        time.sleep(0.2)  # see comment above
+
+
+def test_compute_real_error_still_propagates(monkeypatch):
+    """Same principle as test_lock_acquired_propagates_real_errors: a real
+    bug in _dashboard_data() (not a timeout) must not be swallowed into a
+    stale-cache/503 response."""
+    monkeypatch.setattr(dashboard, "_dashboard_data", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    with patch.object(dashboard, "_load_shared_dashboard_cache", return_value={"stale": True}):
+        with pytest.raises(RuntimeError, match="boom"):
+            dashboard._run_dashboard_compute_bounded()
+
+
+def test_slow_compute_still_populates_cache_for_next_request(monkeypatch):
+    """The timed-out compute isn't cancelled -- once it finishes in the
+    background, it should still save to the shared cache so the *next*
+    request benefits, even though this one already fell back to stale."""
+    monkeypatch.setattr(dashboard, "_DASHBOARD_COMPUTE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(dashboard, "_dashboard_data", lambda: (time.sleep(0.2), {"fresh": True})[1])
+    with patch.object(dashboard, "_load_shared_dashboard_cache", return_value={"stale": True}), \
+         patch.object(dashboard, "_save_shared_dashboard_cache") as m_save:
+        result = dashboard._run_dashboard_compute_bounded()
+        assert result == {"stale": True}
+        m_save.assert_not_called()
+        time.sleep(0.3)  # let the background thread finish
+
+    m_save.assert_called_once_with({"fresh": True})
