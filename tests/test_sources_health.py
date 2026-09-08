@@ -36,7 +36,16 @@ def test_build_sources_health_empty_db(isolated_db):
         db.close()
 
     assert "generated_at" in payload
-    assert payload["summary"] == {"ok": 0, "partial": 0, "dead": 0, "total": 0}
+    # cli-market-core 1.12.67 (COL-1/2/4 collector health honesty) added
+    # circuit_open and coverage_7d_any_data_pct to this summary.
+    assert payload["summary"] == {
+        "ok": 0,
+        "partial": 0,
+        "dead": 0,
+        "total": 0,
+        "circuit_open": 0,
+        "coverage_7d_any_data_pct": 0.0,
+    }
     assert payload["stores"] == []
 
 

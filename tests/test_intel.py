@@ -449,6 +449,12 @@ def test_gondola_advise_returns_digital_shelf_payload(monkeypatch):
              (now - timedelta(hours=72)).isoformat()),
             ("g4", "wong", "Leche Laive Entera 1L", "Laive", 4.0, 5.0, 20, now.isoformat()),
             ("g5", "wong", "Leche Ideal Evaporada 400g", "Ideal", 3.8, None, 0, now.isoformat()),
+            # Category-relevant peer at metro so the LIST action's evidence is
+            # honest (cli-market-core#190/#191: peer evidence must match the
+            # requested category, not just be any fresh row at that store —
+            # "Arroz Costeno" above no longer qualifies as evidence for a
+            # missing leche SKU).
+            ("g6", "metro", "Leche Evaporada Bella Holandesa 405g", "Bella Holandesa", 4.7, None, 0, now.isoformat()),
         ]
         for pid, store, name, brand, price, list_price, discount, ts in rows:
             db.execute(
