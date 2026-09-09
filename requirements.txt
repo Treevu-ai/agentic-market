@@ -2,7 +2,7 @@
 cli-market-core==1.12.71
 
 # Semantic moat — Golden Record persistence (SQLite dev / Postgres prod).
-cli-market-index[postgres] @ git+https://github.com/Treevu-ai/cli-market-index@4ed5f585ece892722cac1d06cb82f2d671635c5d
+cli-market-index[postgres] @ git+https://github.com/Treevu-ai/cli-market-index@aab06b272a6ebabb9dcc127ff375b52b69eecbcf
 
 # Runtime dep the web tier imports directly (also pulled in transitively by the
 # core, kept explicit so the server's Playwright fallback always resolves).
